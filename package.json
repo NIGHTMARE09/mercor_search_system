@@ -1,0 +1,30 @@
+{
+  "name": "mercor_search_system",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon --watch src/**/*.ts --exec ts-node src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@turbopuffer/turbopuffer": "^0.10.14",
+    "@types/mongodb": "^4.0.6",
+    "@types/node": "^24.1.0",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "mongodb": "^6.18.0",
+    "openai": "^5.10.2",
+    "typescript": "^5.8.3",
+    "voyageai": "^0.0.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "nodemon": "^3.1.10",
+    "ts-node": "^10.9.2"
+  }
+}
