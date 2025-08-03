@@ -3,11 +3,9 @@ import { MongoClient, Db, ObjectId } from 'mongodb';
 import Turbopuffer from '@turbopuffer/turbopuffer';
 import dotenv from 'dotenv';
 import { VoyageAIClient, VoyageAIError } from "voyageai";
+import FlexSearch, { Index as FlexSearchIndex } from 'flexsearch';  // NEW: For better fuzzy and partial matching
 dotenv.config();
 
-
-
-// const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const voyage = new VoyageAIClient({ apiKey: process.env.VOYAGE_API_KEY || '' });
 const tpuffer = new Turbopuffer({
     apiKey: process.env.TURBOPUFFER_API_KEY,
@@ -22,15 +20,11 @@ const client = new MongoClient(mongoUri, {
 });
 let db: Db;
 
-
-
 async function connectDb() {
     await client.connect();
     db = client.db('interview_data');
     console.log('Connected to MongoDB');
 }
-
-
 
 interface Profile {
     _id: ObjectId;
@@ -43,14 +37,12 @@ interface Profile {
     awardsAndCertifications: { name: string }[];
 }
 
-
-
 interface Query {
     text: string;
     rerankSummary?: string;
     hardCriteria: {
         skills?: string[];
-        experience?: number | { min: number; max?: number };  // Now supports number or range object
+        experience?: number | { min: number; max?: number };
     };
     softCriteria: {
         skills?: string[];
@@ -83,8 +75,6 @@ async function generateEmbedding(text: string): Promise<number[]> {
     }
 }
 
-
-
 // Cosine Similarity for Vector Matching
 function calculateCosineSimilarity(vec1: number[], vec2: number[]): number {
     if (vec1.length !== vec2.length || vec1.length === 0) return 0;
@@ -94,39 +84,45 @@ function calculateCosineSimilarity(vec1: number[], vec2: number[]): number {
     return magnitude1 * magnitude2 === 0 ? 0 : dotProduct / (magnitude1 * magnitude2);
 }
 
-
-
 // Helper function to filter valid ObjectId strings
 function isValidObjectId(id: string): boolean {
     return /^[0-9a-fA-F]{24}$/.test(id);  // Check for 24 hex chars
 }
 
+// Updated passesHardCriteria: Partial scoring with FlexSearch for fuzzy/partial match
+function passesHardCriteria(p: Profile, h: Query['hardCriteria'], flexIndex: FlexSearchIndex): number {
+    let hardScore = 0;
+    let criteriaCount = 0;
 
-
-// Helper function to check if a profile passes hard criteria (returns 1 or 0)
-function passesHardCriteria(p: Profile, h: Query['hardCriteria']): number {
-    let hardMatch = 1;
     if (h.skills && h.skills.length > 0) {
-        if (!h.skills.every(s => {
-            const hardKeywords = s.toLowerCase().split(' ');
-            return hardKeywords.some(kw => p.skills.some(ps => ps.toLowerCase().includes(kw.toLowerCase())) || p.rerankSummary.toLowerCase().includes(kw.toLowerCase()));
-        })) {
-            hardMatch = 0;
-        }
+        criteriaCount += h.skills.length;
+        let matched = 0;
+        h.skills.forEach(s => {
+            // Use FlexSearch for partial/fuzzy match on profile text
+            const results = flexIndex.search(s.toLowerCase());
+            if (results.length > 0) {  // If any partial match found
+                matched++;
+            }
+        });
+        hardScore += (matched / h.skills.length);
     }
+
     if (h.experience) {
+        criteriaCount += 1;
         let minExp = typeof h.experience === 'number' ? h.experience : h.experience.min;
         let maxExp = typeof h.experience === 'number' ? undefined : h.experience.max;
-        if (p.yearsOfWorkExperience < minExp || (maxExp !== undefined && p.yearsOfWorkExperience > maxExp)) {
-            hardMatch = 0;
+        const yoe = p.yearsOfWorkExperience;
+        if (yoe >= minExp && (maxExp === undefined || yoe <= maxExp)) {
+            hardScore += 1;
+        } else if (yoe >= minExp - 1 && (maxExp === undefined || yoe <= maxExp + 1)) {
+            hardScore += 0.5;  // Partial credit for close matches
         }
     }
-    return hardMatch;
+
+    return criteriaCount > 0 ? hardScore / criteriaCount : 1;
 }
 
-
-
-// Updated searchProfiles
+// Updated searchProfiles with FlexSearch integration
 async function searchProfiles(query: Query): Promise<{ id: string; score: number }[]> {
     console.log('Search query:', query);
     if (!query) {
@@ -147,144 +143,125 @@ async function searchProfiles(query: Query): Promise<{ id: string; score: number
 
     await connectDb();
 
-
     const queryEmbedding = await generateEmbedding(query.text + (query.rerankSummary ? ` ${query.rerankSummary}` : ""));
 
-
     const ns = tpuffer.namespace('mercor-profiles');
-        const vectorResults = await ns.query({
+    const vectorResults = await ns.query({
         rank_by: ['vector', 'ANN', queryEmbedding],
-        top_k: 200,
+        top_k: 150,  // Balanced for performance and recall
     });
-    
 
     const rows = vectorResults.rows ?? [];
     const candidateIds = rows.map(r => r.id.toString());
 
-
     const validCandidateIds = candidateIds.filter(id => isValidObjectId(id));
 
-
     console.log(`Total candidates from TurboPuffer: ${candidateIds.length}, Valid IDs: ${validCandidateIds.length}`);
-
 
     if (validCandidateIds.length === 0) {
         return [];
     }
 
-
     const profiles = await db.collection<Profile>('linkedin_data_subset').find({
         _id: { $in: validCandidateIds.map(id => new ObjectId(id)) }
     }).toArray();
 
+    // NEW: Create FlexSearch index for fetched profiles (on-the-fly, no re-upsert)
+    const flexIndex = new FlexSearchIndex({
+        tokenize: 'forward',  // Partial matching tokenizer
+        cache: true
+    });
+    profiles.forEach(p => {
+        const content = [p.skills.join(' '), p.rerankSummary, p.country, p.awardsAndCertifications.map(a => a.name).join(' ')].join(' ').toLowerCase();
+        flexIndex.add(p._id.toString(), content);
+    });
 
-    const hardFiltered = profiles.filter(p => passesHardCriteria(p, query.hardCriteria) === 1);
-
+    const hardFiltered = profiles.filter(p => passesHardCriteria(p, query.hardCriteria, flexIndex) > 0.5);
 
     const scored = hardFiltered.map(p => {
-        // Recompute hardMatch here using helper function
-        const hardMatch = passesHardCriteria(p, query.hardCriteria);
+        const hardScore = passesHardCriteria(p, query.hardCriteria, flexIndex);
 
         let softAvg = 0;
         const soft = query.softCriteria;
         let softCount = 0;
 
-
         if (soft.skills && soft.skills.length > 0) {
             const matched = soft.skills.filter(s => {
-                const softKeywords = s.toLowerCase().split(' ');
-                return softKeywords.some(kw => p.skills.some(ps => ps.toLowerCase().includes(kw.toLowerCase())) || p.rerankSummary.toLowerCase().includes(kw.toLowerCase()));
+                const results = flexIndex.search(s.toLowerCase());  // Use FlexSearch for soft matching
+                return results.length > 0;
             }).length;
             softAvg += matched / soft.skills.length;
             softCount++;
         }
-
 
         if (soft.country) {
             softAvg += (p.country && p.country.toLowerCase() === soft.country.toLowerCase()) ? 1 : 0;
             softCount++;
         }
 
-
         if (soft.diversity) {
             softAvg += p.awardsAndCertifications.some(a => a.name.toLowerCase().includes('diversity')) ? 1 : 0;
             softCount++;
         }
 
-
         softAvg = softCount > 0 ? softAvg / softCount : 0;
-
 
         const vectorSim = calculateCosineSimilarity(queryEmbedding, p.embedding || new Array(1024).fill(0.001));
 
+        const finalScore = hardScore * (softAvg * 1.5) * vectorSim;  // Weight soft higher
 
-        const finalScore = hardMatch * softAvg * vectorSim;
-
-
-        console.log(`Candidate ID: ${p._id.toString()}, softAvg: ${softAvg}, vectorSim: ${vectorSim}, finalScore: ${finalScore}`);  // Debug log
-
+        console.log(`Candidate ID: ${p._id.toString()}, hardScore: ${hardScore}, softAvg: ${softAvg}, vectorSim: ${vectorSim}, finalScore: ${finalScore}`);
 
         return { id: p._id.toString(), score: finalScore };
     });
 
-
     scored.sort((a, b) => b.score - a.score);
     let results = scored.slice(0, 10);
 
-
     if (results.length < 10) {
         console.log(`Padding results for query - only ${results.length} hard matches found. Config: ${JSON.stringify(query)}`);
-        const nonHardScored = profiles.filter(p => passesHardCriteria(p, query.hardCriteria) === 0).map(p => {
+        const nonHardScored = profiles.filter(p => passesHardCriteria(p, query.hardCriteria, flexIndex) <= 0.5).map(p => {
             let softAvg = 0;
             const soft = query.softCriteria;
             let softCount = 0;
 
-
             if (soft.skills && soft.skills.length > 0) {
                 const matched = soft.skills.filter(s => {
-                    const softKeywords = s.toLowerCase().split(' ');
-                    return softKeywords.some(kw => p.skills.some(ps => ps.toLowerCase().includes(kw.toLowerCase())) || p.rerankSummary.toLowerCase().includes(kw.toLowerCase()));
+                    const results = flexIndex.search(s.toLowerCase());
+                    return results.length > 0;
                 }).length;
                 softAvg += matched / soft.skills.length;
                 softCount++;
             }
-
 
             if (soft.country) {
                 softAvg += (p.country && p.country.toLowerCase() === soft.country.toLowerCase()) ? 1 : 0;
                 softCount++;
             }
 
-
             if (soft.diversity) {
                 softAvg += p.awardsAndCertifications.some(a => a.name.toLowerCase().includes('diversity')) ? 1 : 0;
                 softCount++;
             }
 
-
             softAvg = softCount > 0 ? softAvg / softCount : 0;
-
 
             const vectorSim = calculateCosineSimilarity(queryEmbedding, p.embedding || new Array(1024).fill(0.001));
 
-
-            return { id: p._id.toString(), score: softAvg * vectorSim };
+            return { id: p._id.toString(), score: softAvg * vectorSim * 0.8 };  // Penalty for padding
         });
-
 
         nonHardScored.sort((a, b) => b.score - a.score);
         results = results.concat(nonHardScored.slice(0, 10 - results.length));
     }
 
-
     return results;
 }
-
-
 
 async function upsertProfiles() {
     await connectDb();
     console.log("Starting upsert in batches...");
+
 
 
     // Delete existing namespace to clear invalid IDs (using client-level method)
@@ -297,12 +274,15 @@ async function upsertProfiles() {
     }
 
 
+
     const batchSize = 1000;
     let skip = 0;
     let hasMore = true;
 
 
+
     const ns = tpuffer.namespace('mercor-profiles');
+
 
 
     while (hasMore) {
@@ -313,13 +293,16 @@ async function upsertProfiles() {
             .toArray();
 
 
+
         if (profiles.length === 0) {
             hasMore = false;
             break;
         }
 
 
+
         console.log(`Upserting batch of ${profiles.length} profiles...`);
+
 
 
         try {
@@ -340,12 +323,15 @@ async function upsertProfiles() {
         }
 
 
+
         skip += batchSize;
     }
 
 
+
     console.log("All batches upserted successfully!");
 }
+
 
 
 
