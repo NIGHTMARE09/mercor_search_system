@@ -26,7 +26,7 @@ app.post('/search', async(req, res) =>{
             console.log('Validation failed:', { query, hasText: !!query?.text });
             return res.status(400).json({error: 'Invalid query format - text field is required'});
         }
-        console.log('Calling searchProfiles with query:', query); // Debug function call
+        console.log('Calling searchProfiles with query:', query); 
         const results = await searchProfiles(query);
         console.log('Search results:', results);
         res.status(200).json(results);
