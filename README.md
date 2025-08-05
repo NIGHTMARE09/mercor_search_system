@@ -101,7 +101,7 @@ Added keyword extraction to handle long criteria sentences (e.g., splitting "Res
 
 Synonyms for recall boost (e.g., "phd" to "doctorate") targeted low-performing configs like mathematics_phd.
 
-Optimized for recall (top_k=300, lenient hard thresholds) over precision, as per evaluation metric (hit rate at top 10/100).
+Optimized for recall (top_k=150, lenient hard thresholds) over precision, as per evaluation metric (hit rate at top 10/100).
 
 ## Validation/Analysis
 
